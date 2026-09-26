@@ -149,6 +149,7 @@ function drawOverlays(
     .map((region) => region.realtime)
     .filter((value): value is number => value !== null);
   const range = priceRange(prices);
+  const peakZoneId = expensiveZoneId(regions);
   const bounds = new maps.LatLngBounds();
 
   for (const region of regions) {
@@ -167,9 +168,9 @@ function drawOverlays(
         fillOpacity: isDark ? 0.62 : 0.48,
         map,
         paths: place.path,
-        strokeColor: isDark ? '#f5f7fb' : '#102033',
-        strokeOpacity: 0.75,
-        strokeWeight: 1.5,
+        strokeColor: region.id === peakZoneId ? '#ffffff' : isDark ? '#f5f7fb' : '#102033',
+        strokeOpacity: region.id === peakZoneId ? 0.95 : 0.75,
+        strokeWeight: region.id === peakZoneId ? 3 : 1.5,
         zIndex: 1,
       });
       polygon.addListener('click', () => {
@@ -217,10 +218,18 @@ function drawOverlays(
         fillColor: tieColor(tie.megawatts),
         fillOpacity: 1,
         path: maps.SymbolPath.CIRCLE,
-        scale: 9,
+        scale: tieLabel(tie.megawatts) ? 16 : 9,
         strokeColor: '#ffffff',
         strokeWeight: 2,
       },
+      label: tieLabel(tie.megawatts)
+        ? {
+            color: '#ffffff',
+            fontSize: '11px',
+            fontWeight: '700',
+            text: tieLabel(tie.megawatts),
+          }
+        : undefined,
       map,
       position: place.position,
       title: `${place.title}, ${describeTie(tie.megawatts)}`,
@@ -275,8 +284,11 @@ function openRegion(
       text: `${formatSignedPrice(region.realtime - region.dayAhead)} vs day-ahead`,
     });
   }
-  if (region.hubRealtime !== null) {
-    lines.push({ text: `Trading hub ${formatPrice(region.hubRealtime)}` });
+  if (region.hubRealtime !== null && region.realtime !== null) {
+    const gap = region.realtime - region.hubRealtime;
+    lines.push({
+      text: `Trading hub ${formatPrice(region.hubRealtime)} (${formatSignedPrice(gap)} on the zone)`,
+    });
   }
   if (region.note) {
     lines.push({ text: region.note });
@@ -305,6 +317,26 @@ function infoElement(lines: { strong?: boolean; text: string }[]): HTMLElement {
   }
 
   return root;
+}
+
+function expensiveZoneId(regions: MapRegionView[]): string | null {
+  let peak: MapRegionView | null = null;
+  for (const region of regions) {
+    if (region.kind !== 'zone' || region.realtime === null) {
+      continue;
+    }
+    if (!peak || peak.realtime === null || region.realtime > peak.realtime) {
+      peak = region;
+    }
+  }
+  return peak?.id ?? null;
+}
+
+function tieLabel(megawatts: number): string {
+  if (Math.abs(megawatts) < 5) {
+    return '';
+  }
+  return String(Math.round(Math.abs(megawatts)));
 }
 
 function tieColor(megawatts: number): string {

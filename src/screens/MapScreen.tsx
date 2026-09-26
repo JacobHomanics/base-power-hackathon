@@ -7,13 +7,14 @@ import { ErcotMap } from '@/components/ErcotMap';
 import type { ErcotMapStatus } from '@/components/ercotMapTypes';
 import { APP_BRAND_HEX } from '@/constants/brand';
 import type { AppThemeColors } from '@/constants/theme';
-import { formatCentralTime, formatPrice } from '@/ercot/format';
+import { formatCentralTime, formatPrice, formatSignedPrice } from '@/ercot/format';
 import {
   priceFill,
   priceRange,
   type MapRegionView,
   type MapTieView,
 } from '@/ercot/geography';
+import { mapInsights } from '@/ercot/mapInsights';
 import type { ErcotSnapshot, PriceQuote } from '@/ercot/types';
 import { useAppTheme } from '@/hooks/useAppTheme';
 import { useErcotSnapshot } from '@/hooks/useErcotSnapshot';
@@ -44,6 +45,7 @@ export function MapScreen() {
       .map((region) => region.realtime)
       .filter((value): value is number => value !== null),
   );
+  const insights = snapshot ? mapInsights(snapshot) : [];
 
   return (
     <View style={styles.root}>
@@ -79,6 +81,15 @@ export function MapScreen() {
                   : `Updated ${formatCentralTime(snapshot.updatedAt)}`
                 : null}
           </Text>
+          {insights.length > 0 ? (
+            <View style={styles.insights}>
+              {insights.map((insight) => (
+                <Text key={insight} style={styles.insight}>
+                  {insight}
+                </Text>
+              ))}
+            </View>
+          ) : null}
           {error && !snapshot ? <Text style={styles.body}>{error}</Text> : null}
           {mapStatus === 'error' ? (
             <Text style={styles.body}>Google Maps could not load. Check the API key restrictions.</Text>
@@ -118,6 +129,9 @@ export function MapScreen() {
                 <Text style={styles.legendValue}>
                   {region.realtime === null ? '—' : formatPrice(region.realtime)}
                 </Text>
+                <Text style={[styles.legendDelta, { color: deltaColor(region, colors) }]}>
+                  {dayAheadDelta(region)}
+                </Text>
               </View>
             ))}
           </View>
@@ -132,7 +146,8 @@ export function MapScreen() {
             </View>
           </View>
           <Text style={styles.caption}>
-            Zone shapes are simplified. Dots are the DC ties.
+            The last column is real-time minus day-ahead. Dots are DC ties, labeled in MW.
+            Zone shapes are simplified.
           </Text>
         </View>
       </View>
@@ -175,6 +190,27 @@ function buildRegions(snapshot: ErcotSnapshot | null): MapRegionView[] {
   ];
 }
 
+function dayAheadDelta(region: MapRegionView): string {
+  if (region.realtime === null || region.dayAhead === null) {
+    return '—';
+  }
+  return formatSignedPrice(region.realtime - region.dayAhead);
+}
+
+function deltaColor(region: MapRegionView, colors: AppThemeColors): string {
+  if (region.realtime === null || region.dayAhead === null) {
+    return colors.textMuted;
+  }
+  const delta = region.realtime - region.dayAhead;
+  if (delta >= 15) {
+    return colors.warning;
+  }
+  if (delta <= -5) {
+    return colors.positive;
+  }
+  return colors.textSecondary;
+}
+
 function conditionColor(snapshot: ErcotSnapshot, colors: AppThemeColors): string {
   if (snapshot.eeaLevel > 0 || /emergency|eea/i.test(snapshot.conditionState)) {
     return colors.error;
@@ -208,7 +244,7 @@ function createStyles(colors: AppThemeColors) {
       borderColor: colors.border,
       borderRadius: 16,
       borderWidth: 1,
-      maxWidth: 320,
+      maxWidth: 360,
       padding: 14,
     },
     back: {
@@ -240,6 +276,15 @@ function createStyles(colors: AppThemeColors) {
       color: colors.text,
       fontSize: 14,
       lineHeight: 20,
+    },
+    insights: {
+      marginTop: 10,
+      gap: 6,
+    },
+    insight: {
+      color: colors.text,
+      fontSize: 13,
+      lineHeight: 18,
     },
     retry: {
       alignSelf: 'flex-start',
@@ -285,6 +330,15 @@ function createStyles(colors: AppThemeColors) {
       fontSize: 14,
       fontVariant: ['tabular-nums'],
       fontWeight: '700',
+      width: 64,
+      textAlign: 'right',
+    },
+    legendDelta: {
+      fontSize: 13,
+      fontVariant: ['tabular-nums'],
+      fontWeight: '600',
+      width: 64,
+      textAlign: 'right',
     },
     tieKey: {
       flexDirection: 'row',
