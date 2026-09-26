@@ -79,15 +79,24 @@ export function ErcotScreen() {
             subtitle="Live supply, prices, batteries, and reserves from the Texas grid."
             title="ERCOT"
           />
-          <Pressable
-            accessibilityRole="button"
-            onPress={() => {
-              navigation.navigate('map');
-            }}
-            style={styles.mapLink}
-          >
-            <Text style={styles.link}>Open price map</Text>
-          </Pressable>
+          <View style={styles.linkRow}>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => {
+                navigation.navigate('map');
+              }}
+            >
+              <Text style={styles.link}>Open price map</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => {
+                navigation.navigate('scan');
+              }}
+            >
+              <Text style={styles.link}>Check for a can</Text>
+            </Pressable>
+          </View>
           {loading && !snapshot ? (
             <Text style={styles.status}>Loading the Texas grid…</Text>
           ) : null}
@@ -685,8 +694,10 @@ function createStyles(colors: AppThemeColors, isWide: boolean) {
       color: colors.textSecondary,
       fontSize: 14,
     },
-    mapLink: {
-      alignSelf: 'flex-start',
+    linkRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 16,
       marginTop: 16,
     },
     link: {
