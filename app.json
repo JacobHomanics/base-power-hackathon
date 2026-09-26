@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "Base Power",
+    "slug": "base-power-hackathon",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "basepower",
+    "userInterfaceStyle": "automatic",
+    "description": "Base Power hackathon app.",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.jacobhomanics.basepower"
+    },
+    "android": {
+      "package": "com.jacobhomanics.basepower",
+      "adaptiveIcon": {
+        "backgroundColor": "#0052FF",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro",
+      "output": "single",
+      "name": "Base Power",
+      "shortName": "Base Power",
+      "themeColor": "#0052FF",
+      "backgroundColor": "#0052FF",
+      "description": "Base Power hackathon app."
+    },
+    "plugins": [
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#0052FF",
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200
+        }
+      ]
+    ]
+  }
+}
