@@ -1,3 +1,4 @@
+import { useNavigation, type NavigationProp } from '@react-navigation/native';
 import { useMemo, type ReactNode } from 'react';
 import {
   Linking,
@@ -29,6 +30,7 @@ import type { ErcotSnapshot, PriceQuote } from '@/ercot/types';
 import { useAppTheme } from '@/hooks/useAppTheme';
 import { useErcotSnapshot } from '@/hooks/useErcotSnapshot';
 import { useIsDesktopWeb } from '@/hooks/useIsDesktopWeb';
+import type { RootStackParamList } from '@/navigation/types';
 
 const ERCOT_DASHBOARDS = 'https://www.ercot.com/gridmktinfo/dashboards';
 
@@ -48,6 +50,7 @@ export function ErcotScreen() {
   const isWide = useIsDesktopWeb();
   const styles = useMemo(() => createStyles(colors, isWide), [colors, isWide]);
   const insets = useSafeAreaInsets();
+  const navigation = useNavigation<NavigationProp<RootStackParamList>>();
   const { snapshot, error, loading, refreshing, refresh } = useErcotSnapshot();
 
   return (
@@ -76,6 +79,15 @@ export function ErcotScreen() {
             subtitle="Live supply, prices, batteries, and reserves from the Texas grid."
             title="ERCOT"
           />
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => {
+              navigation.navigate('map');
+            }}
+            style={styles.mapLink}
+          >
+            <Text style={styles.link}>Open price map</Text>
+          </Pressable>
           {loading && !snapshot ? (
             <Text style={styles.status}>Loading the Texas grid…</Text>
           ) : null}
@@ -672,6 +684,10 @@ function createStyles(colors: AppThemeColors, isWide: boolean) {
     updated: {
       color: colors.textSecondary,
       fontSize: 14,
+    },
+    mapLink: {
+      alignSelf: 'flex-start',
+      marginTop: 16,
     },
     link: {
       color: colors.brandAccent,

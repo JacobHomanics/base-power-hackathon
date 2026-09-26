@@ -32,6 +32,7 @@ export const rootLinking: LinkingOptions<RootStackParamList> = {
   config: {
     screens: {
       home: '',
+      map: 'map',
     },
   },
 };

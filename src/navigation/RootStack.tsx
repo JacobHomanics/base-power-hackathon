@@ -23,11 +23,14 @@ export function RootStack() {
         contentStyle: { backgroundColor: colors.background },
       }}
     >
-      <NativeStack.Screen
-        name="home"
-        component={rootStackScreens.home}
-        options={{ title: rootStackScreenTitles.home }}
-      />
+      {(Object.keys(rootStackScreens) as (keyof RootStackParamList)[]).map((name) => (
+        <NativeStack.Screen
+          key={name}
+          component={rootStackScreens[name]}
+          name={name}
+          options={{ title: rootStackScreenTitles[name] }}
+        />
+      ))}
     </NativeStack.Navigator>
   );
 }
