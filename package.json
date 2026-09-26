@@ -4,11 +4,12 @@
   "main": "index.ts",
   "private": true,
   "scripts": {
+    "postinstall": "node scripts/prepare-detector.mjs",
     "start": "expo start",
-    "web": "expo start --web",
+    "web": "node scripts/prepare-detector.mjs && expo start --web",
     "ios": "expo start --ios",
     "android": "expo start --android",
-    "build:web": "expo export -p web",
+    "build:web": "node scripts/prepare-detector.mjs && expo export -p web",
     "lint": "eslint . --max-warnings 0 && tsc --noEmit --incremental",
     "check-types": "tsc --noEmit --incremental"
   },
@@ -23,6 +24,7 @@
     "expo-linking": "~57.0.11",
     "expo-splash-screen": "~57.0.9",
     "expo-status-bar": "~57.0.1",
+    "onnxruntime-web": "1.22.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native": "0.86.3",

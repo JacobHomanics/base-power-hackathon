@@ -1,6 +1,5 @@
 import type { ComponentType } from 'react';
 
-import { APP_NAME } from '@/constants/brand';
 import {
   ROOT_STACK_INITIAL_ROUTE,
   type RootStackParamList,
@@ -10,7 +9,7 @@ import { HomeScreen } from '@/screens/HomeScreen';
 export { ROOT_STACK_INITIAL_ROUTE };
 
 export const rootStackScreenTitles = {
-  home: APP_NAME,
+  home: 'Check a photo',
 } as const;
 
 export const rootStackScreens = {

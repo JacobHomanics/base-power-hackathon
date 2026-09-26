@@ -12,6 +12,8 @@ module.exports = defineConfig([
       'ios/**',
       'android/**',
       '*.config.js',
+      'public/ort/**',
+      'public/model/**',
     ],
   },
 ]);

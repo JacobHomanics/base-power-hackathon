@@ -36,6 +36,10 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
+# Detector weights and ONNX Runtime, fetched by scripts/prepare-detector.mjs
+/public/model/
+/public/ort/
+
 # generated native folders
 /ios
 /android
