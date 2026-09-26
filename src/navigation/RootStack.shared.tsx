@@ -9,7 +9,7 @@ import { HomeScreen } from '@/screens/HomeScreen';
 export { ROOT_STACK_INITIAL_ROUTE };
 
 export const rootStackScreenTitles = {
-  home: 'Check a photo',
+  home: 'Find a can',
 } as const;
 
 export const rootStackScreens = {

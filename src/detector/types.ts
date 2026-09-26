@@ -1,11 +1,18 @@
+export type CanBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  score: number;
+};
+
 export type PhotoAnalysis = {
   status: 'scored' | 'skipped';
-  tone: 'ai' | 'unsure' | 'real' | 'muted';
+  tone: 'can' | 'clear' | 'muted';
   label: string;
   detail: string;
-  meta: string | null;
   percent: number | null;
-  secondView: boolean;
+  boxes: CanBox[];
 };
 
 export type PrepareListener = {

@@ -1,22 +1,23 @@
-// On-device session for the Sieve v0.14 ONNX model (MIT).
-// Weights download once from this site, then stay in origin-private storage.
+// On-device session for the can detector. Weights load from this site, then stay
+// in origin-private storage.
 
 import manifest from '@/detector/manifest.json';
 import type { PrepareListener } from '@/detector/types';
 
-const MODEL_FILE = 'sieve-model.onnx';
-const META_FILE = 'sieve-model-meta.json';
+const MODEL_FILE = 'can-model.onnx';
+const META_FILE = 'can-model-meta.json';
 const PUBLIC_MODEL_PATH = `/model/${manifest.filename}`;
 const ORT_SCRIPT = '/ort/ort.webgpu.min.js';
 
 type CacheMeta = {
   sha256: string;
   version: string;
-  wasmRefLogit?: number;
+  wasmFingerprint?: number;
 };
 
 type OrtTensor = {
   data?: ArrayLike<number>;
+  dims?: readonly number[];
   location?: string;
   getData?: () => Promise<ArrayLike<number>>;
 };
@@ -48,6 +49,12 @@ type ReadySession = {
   session: OrtSession;
   backend: string;
   ort: OrtApi;
+};
+
+export type DetectionOutput = {
+  data: Float32Array;
+  dims: readonly number[];
+  backend: string;
 };
 
 let memoryBytes: ArrayBuffer | null = null;
@@ -189,12 +196,12 @@ function loadOrt(): Promise<OrtApi> {
     script.onload = () => {
       const ort = (window as Window & { ort?: OrtApi }).ort;
       if (!ort) {
-        reject(new Error('The scoring runtime loaded without a global.'));
+        reject(new Error('The detector runtime loaded without a global.'));
         return;
       }
       resolve(configureOrt(ort));
     };
-    script.onerror = () => reject(new Error('The scoring runtime failed to load.'));
+    script.onerror = () => reject(new Error('The detector runtime failed to load.'));
     document.head.appendChild(script);
   });
 }
@@ -219,38 +226,51 @@ async function hasHardwareGpu(): Promise<boolean> {
   }
 }
 
-function selftestInput(ort: OrtApi, size: number) {
+function probeTensor(ort: OrtApi) {
+  const size = manifest.inputSize;
   const n = 3 * size * size;
   const out = new Float32Array(n);
   let state = 0x5eed1234 >>> 0;
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < n; i += 1) {
     state ^= state << 13;
     state >>>= 0;
     state ^= state >>> 17;
     state ^= state << 5;
     state >>>= 0;
-    out[i] = (state / 4294967296 - 0.45) / 0.225;
+    out[i] = state / 4294967296;
   }
   return new ort.Tensor('float32', out, [1, 3, size, size]);
 }
 
-async function tensorScalar(output: OrtTensor | undefined): Promise<number> {
-  if (!output) throw new Error('The model returned no score.');
-  try {
-    if (output.data && (output.location === undefined || output.location === 'cpu')) {
-      return Number(output.data[0]);
-    }
-  } catch {
-    // WebGPU can keep the scalar off-CPU until getData().
+function fingerprint(data: Float32Array): number {
+  let hash = 2166136261;
+  for (let i = 0; i < data.length; i += 17) {
+    hash ^= Math.round(data[i]) + i;
+    hash = Math.imul(hash, 16777619);
   }
-  if (!output.getData) throw new Error('The model returned an unreadable score.');
-  const data = await output.getData();
-  return Number(data[0]);
+  return hash >>> 0;
 }
 
-async function logitOf(session: OrtSession, tensor: unknown): Promise<number> {
-  const result = await session.run({ [session.inputNames[0] ?? 'input']: tensor });
-  return tensorScalar(result[session.outputNames[0] ?? '']);
+async function tensorFloats(output: OrtTensor | undefined): Promise<{ data: Float32Array; dims: readonly number[] }> {
+  if (!output) throw new Error('The model returned no detections.');
+  const dims = output.dims ?? [];
+  try {
+    if (output.data && (output.location === undefined || output.location === 'cpu')) {
+      const data = output.data instanceof Float32Array ? output.data : Float32Array.from(output.data);
+      return { data, dims };
+    }
+  } catch {
+    // WebGPU can keep the tensor off-CPU until getData().
+  }
+  if (!output.getData) throw new Error('The model returned an unreadable detection.');
+  const raw = await output.getData();
+  const data = raw instanceof Float32Array ? raw : Float32Array.from(raw);
+  return { data, dims };
+}
+
+async function runSession(session: OrtSession, tensor: unknown): Promise<{ data: Float32Array; dims: readonly number[] }> {
+  const result = await session.run({ [session.inputNames[0] ?? 'images']: tensor });
+  return tensorFloats(result[session.outputNames[0] ?? '']);
 }
 
 async function openSession(ort: OrtApi, bytes: ArrayBuffer): Promise<{ session: OrtSession; backend: string }> {
@@ -266,18 +286,18 @@ async function openSession(ort: OrtApi, bytes: ArrayBuffer): Promise<{ session: 
       executionProviders: ['webgpu'],
       graphOptimizationLevel: 'all',
     });
-    const probe = selftestInput(ort, manifest.inputSize);
-    const gpuLogit = await logitOf(gpu, probe);
+    const probe = probeTensor(ort);
+    const gpuOut = await runSession(gpu, probe);
     const meta = (await readMeta()) ?? { sha256: manifest.sha256, version: manifest.version };
-    let ref = meta.wasmRefLogit;
+    let ref = meta.wasmFingerprint;
     let wasmHeld: OrtSession | null = null;
     if (typeof ref !== 'number') {
       wasmHeld = await wasmSession();
-      ref = await logitOf(wasmHeld, probe);
-      meta.wasmRefLogit = ref;
+      ref = fingerprint((await runSession(wasmHeld, probe)).data);
+      meta.wasmFingerprint = ref;
       writeMeta(meta).catch(() => undefined);
     }
-    if (Math.abs(gpuLogit - ref) > 0.5) {
+    if (fingerprint(gpuOut.data) !== ref) {
       const session = wasmHeld ?? (await wasmSession());
       return { session, backend: 'WASM' };
     }
@@ -290,7 +310,7 @@ async function openSession(ort: OrtApi, bytes: ArrayBuffer): Promise<{ session: 
       const detail = wasmError instanceof Error ? wasmError.message : String(wasmError);
       const reason = gpuError instanceof Error ? gpuError.message : '';
       throw new Error(
-        `The scoring runtime failed to start. ${detail}${reason ? ` (${reason})` : ''}`,
+        `The detector runtime failed to start. ${detail}${reason ? ` (${reason})` : ''}`,
       );
     }
   }
@@ -320,14 +340,15 @@ export function prepareModel(listener?: PrepareListener): Promise<{ backend: str
   return inflight.then(({ backend }) => ({ backend }));
 }
 
-export function scoreTensor(data: Float32Array): Promise<{ logit: number; backend: string }> {
+export function detectTensor(data: Float32Array): Promise<DetectionOutput> {
   const task = async () => {
     const current = await prepareModel();
     const active = ready;
     if (!active) throw new Error('The model is not ready.');
-    const tensor = new active.ort.Tensor('float32', data, [1, 3, manifest.inputSize, manifest.inputSize]);
-    const logit = await logitOf(active.session, tensor);
-    return { logit, backend: current.backend };
+    const size = manifest.inputSize;
+    const tensor = new active.ort.Tensor('float32', data, [1, 3, size, size]);
+    const output = await runSession(active.session, tensor);
+    return { ...output, backend: current.backend };
   };
   const run = chain.then(task, task);
   chain = run.then(

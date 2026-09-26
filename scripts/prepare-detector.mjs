@@ -1,11 +1,9 @@
-// Copies the ONNX Runtime Web files and the pinned Sieve model into public/
-// so the browser can load them from the same origin. GitHub release assets
-// do not send CORS headers, so the page cannot fetch the model directly.
+// Copies the ONNX Runtime Web files and the vendored can detector into public/
+// so the browser can load them from the same origin.
 
 import { createHash } from 'node:crypto';
 import {
   createReadStream,
-  createWriteStream,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -15,7 +13,6 @@ import {
 } from 'node:fs';
 import { copyFile } from 'node:fs/promises';
 import path from 'node:path';
-import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -39,6 +36,7 @@ async function ensureModel() {
   mkdirSync(dir, { recursive: true });
   const dest = path.join(dir, manifest.filename);
   const stamp = path.join(dir, `${manifest.filename}.sha256`);
+  const source = path.join(root, 'models', manifest.filename);
   if (
     existsSync(dest) &&
     existsSync(stamp) &&
@@ -47,20 +45,17 @@ async function ensureModel() {
   ) {
     return;
   }
-
-  console.log(`Downloading ${manifest.filename} (${Math.round(manifest.bytes / 1e6)} MB)…`);
-  const response = await fetch(manifest.sourceUrl);
-  if (!response.ok || !response.body) {
-    throw new Error(`Model download failed (${response.status}) from ${manifest.sourceUrl}`);
+  if (!existsSync(source)) {
+    throw new Error(`Missing ${source}. The can detector weights are vendored in models/.`);
   }
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(dest));
+  await copyFile(source, dest);
   const hash = await sha256(dest);
-  if (hash !== manifest.sha256) {
+  if (hash !== manifest.sha256 || statSync(dest).size !== manifest.bytes) {
     rmSync(dest, { force: true });
     throw new Error(`Model checksum mismatch: ${hash}`);
   }
   writeFileSync(stamp, `${manifest.sha256}\n`);
-  console.log(`Saved ${dest}`);
+  console.log(`Copied ${dest}`);
 }
 
 async function ensureRuntime() {
