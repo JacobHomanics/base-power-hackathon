@@ -20,6 +20,8 @@ export type AppThemeColors = {
   brand: string;
   brandAccent: string;
   onBrand: string;
+  positive: string;
+  warning: string;
   error: string;
   statusBarStyle: 'light' | 'dark';
 };
@@ -34,6 +36,8 @@ const LIGHT_THEME: AppThemeColors = {
   brand: APP_BRAND_HEX,
   brandAccent: APP_BRAND_HEX,
   onBrand: '#ffffff',
+  positive: '#067647',
+  warning: '#b54708',
   error: '#b42318',
   statusBarStyle: 'dark',
 };
@@ -48,6 +52,8 @@ const DARK_THEME: AppThemeColors = {
   brand: APP_BRAND_HEX,
   brandAccent: APP_BRAND_ACCENT_DARK_HEX,
   onBrand: '#ffffff',
+  positive: '#3ddc97',
+  warning: '#f5a524',
   error: '#ff6b6b',
   statusBarStyle: 'light',
 };
