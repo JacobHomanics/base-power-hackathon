@@ -1,3 +1,4 @@
+import { useFocusEffect } from '@react-navigation/native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -12,148 +13,215 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { ScreenHeader } from '@/components/ScreenHeader';
-import { APP_BRAND_HEX } from '@/constants/brand';
-import type { AppThemeColors } from '@/constants/theme';
 import {
-  analyzePhoto,
-  detectorSupported,
-  modelIsCached,
-  prepareModel,
-  readyBackend,
-  type PhotoAnalysis,
-} from '@/detector/engine';
-import type { CanBox } from '@/detector/types';
-import manifest from '@/detector/manifest.json';
+  armedCameraPromise,
+  cameraListenerCount,
+  claimArmedCamera,
+  hasArmedCamera,
+  retainCameraListener,
+} from '@/camera/live';
+import { BreakerOverlay } from '@/camera/BreakerOverlay';
+import { MeterOverlay } from '@/camera/MeterOverlay';
+import { ScreenHeader } from '@/components/ScreenHeader';
+import type { AppThemeColors } from '@/constants/theme';
 import { useAppTheme } from '@/hooks/useAppTheme';
 import { useIsDesktopWeb } from '@/hooks/useIsDesktopWeb';
-
-type Phase =
-  | { status: 'checking' }
-  | { status: 'missing' }
-  | { status: 'downloading'; loaded: number; total: number }
-  | { status: 'starting' }
-  | { status: 'ready'; backend: string }
-  | { status: 'error'; message: string };
+import { photoFromBlob, scorePhotos, type PhotoPayload } from '@/score/client';
+import { QUESTIONS, type Check, type HomeScore, type Outcome } from '@/score/decide';
 
 type Job =
   | { status: 'idle' }
   | { status: 'running' }
-  | { status: 'done'; analysis: PhotoAnalysis }
+  | { status: 'done'; score: HomeScore }
   | { status: 'failed'; message: string };
 
-const MODEL_MB = Math.round(manifest.bytes / 1_000_000);
+const SHOT_SCALES = [1, 0.75, 0.55, 0.38];
+
+function cameraHint(step: 'meter' | 'breaker', shotIndex: number): string {
+  if (step === 'meter') {
+    return shotIndex === 0
+      ? 'Center the meter in the outline.'
+      : 'Step back and fit the meter in the smaller outline.';
+  }
+  return shotIndex === 0
+    ? 'Now center the breaker in the outline.'
+    : 'Step back and fit the breaker in the smaller outline.';
+}
 
 export function HomeScreen() {
   const { colors, isDark } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const insets = useSafeAreaInsets();
   const isDesktop = useIsDesktopWeb();
-  const [phase, setPhase] = useState<Phase>(
-    detectorSupported ? { status: 'checking' } : { status: 'error', message: '' },
-  );
   const [job, setJob] = useState<Job>({ status: 'idle' });
-  const [previewUri, setPreviewUri] = useState<string | null>(null);
+  const [photos, setPhotos] = useState<PhotoPayload[]>([]);
   const [dragActive, setDragActive] = useState(false);
-  const previewRef = useRef<string | null>(null);
+  const [camera, setCamera] = useState<'off' | 'opening' | 'live' | 'blocked'>(
+    hasArmedCamera() ? 'opening' : 'off',
+  );
+  const [cameraMessage, setCameraMessage] = useState<string | null>(null);
+  const [step, setStep] = useState<'meter' | 'breaker'>('meter');
+  const [shotIndex, setShotIndex] = useState(0);
+  const [capturing, setCapturing] = useState(false);
+  const photosRef = useRef<PhotoPayload[]>([]);
+  const pendingShotsRef = useRef<PhotoPayload[]>([]);
+  const captureToken = useRef(0);
   const runId = useRef(0);
   const dropRef = useRef<View>(null);
-  const runBytesRef = useRef<(bytes: Uint8Array, mime: string, name: string) => void>(() => undefined);
+  const cameraFrameRef = useRef<View>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const scoreFilesRef = useRef<(files: File[]) => void>(() => undefined);
 
-  const replacePreview = useCallback((next: string | null) => {
-    if (previewRef.current) URL.revokeObjectURL(previewRef.current);
-    previewRef.current = next;
-    setPreviewUri(next);
+  const replacePhotos = useCallback((next: PhotoPayload[]) => {
+    for (const photo of photosRef.current) URL.revokeObjectURL(photo.previewUrl);
+    photosRef.current = next;
+    setPhotos(next);
   }, []);
+
+  const discardPendingShots = useCallback(() => {
+    captureToken.current += 1;
+    for (const photo of pendingShotsRef.current) URL.revokeObjectURL(photo.previewUrl);
+    pendingShotsRef.current = [];
+    setStep('meter');
+    setShotIndex(0);
+    setCapturing(false);
+  }, []);
+  const discardPendingShotsRef = useRef(discardPendingShots);
+  discardPendingShotsRef.current = discardPendingShots;
+
+  const closeCamera = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    videoRef.current = null;
+    setCamera('off');
+    discardPendingShots();
+  }, [discardPendingShots]);
 
   useEffect(() => {
     return () => {
-      if (previewRef.current) URL.revokeObjectURL(previewRef.current);
+      for (const photo of photosRef.current) URL.revokeObjectURL(photo.previewUrl);
+      for (const photo of pendingShotsRef.current) URL.revokeObjectURL(photo.previewUrl);
+      streamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
 
-  const ensureReady = useCallback(async () => {
-    const existing = readyBackend();
-    if (existing) {
-      setPhase({ status: 'ready', backend: existing });
-      return;
-    }
-    try {
-      if (await modelIsCached()) setPhase({ status: 'starting' });
-      else setPhase({ status: 'downloading', loaded: 0, total: manifest.bytes });
-      const { backend } = await prepareModel({
-        onProgress: (loaded, total) => setPhase({ status: 'downloading', loaded, total }),
-        onStarting: () => setPhase({ status: 'starting' }),
-      });
-      setPhase({ status: 'ready', backend });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'The detector failed to start.';
-      setPhase({ status: 'error', message });
-      throw error;
-    }
-  }, []);
+  useFocusEffect(
+    useCallback(() => {
+      const pending = armedCameraPromise();
+      if (!pending || Platform.OS !== 'web') return undefined;
+      const release = retainCameraListener();
+      let alive = true;
+      setCameraMessage(null);
+      setCamera('opening');
+      void pending
+        .then((stream) => {
+          const replaced = armedCameraPromise() !== pending;
+          if (!alive || replaced) {
+            if (replaced || cameraListenerCount() === 0) {
+              stream.getTracks().forEach((track) => track.stop());
+            }
+            return;
+          }
+          claimArmedCamera(pending);
+          streamRef.current?.getTracks().forEach((track) => track.stop());
+          streamRef.current = stream;
+          setCamera('live');
+        })
+        .catch(() => {
+          if (!alive || armedCameraPromise() !== pending) return;
+          claimArmedCamera(pending);
+          setCamera('blocked');
+          setCameraMessage('This browser could not open the camera. Choose a photo instead.');
+        });
+      return () => {
+        alive = false;
+        release();
+        discardPendingShotsRef.current();
+        const stream = streamRef.current;
+        if (!stream) return;
+        stream.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+        videoRef.current = null;
+        setCamera('off');
+      };
+    }, []),
+  );
 
-  const runBytes = useCallback(
-    async (bytes: Uint8Array, mime: string, name: string) => {
+  useEffect(() => {
+    if (camera !== 'live' || Platform.OS !== 'web') return;
+    const node = cameraFrameRef.current as unknown as HTMLElement | null;
+    const stream = streamRef.current;
+    if (!node || !stream) return;
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.srcObject = stream;
+    video.style.position = 'absolute';
+    video.style.inset = '0';
+    video.style.width = '100%';
+    video.style.height = '100%';
+    video.style.objectFit = 'cover';
+    video.style.display = 'block';
+    node.replaceChildren(video);
+    videoRef.current = video;
+    return () => {
+      videoRef.current = null;
+      node.replaceChildren();
+    };
+  }, [camera]);
+
+  const runPayloads = useCallback(
+    async (payloads: PhotoPayload[]) => {
       const id = ++runId.current;
-      const blob = new Blob([bytesToBuffer(bytes)], { type: mime || 'image/*' });
-      replacePreview(URL.createObjectURL(blob));
+      replacePhotos(payloads);
       setJob({ status: 'running' });
       try {
-        await ensureReady();
+        const score = await scorePhotos(payloads);
         if (id !== runId.current) return;
-        const analysis = await analyzePhoto(bytes, mime);
-        if (id !== runId.current) return;
-        if (analysis.boxes.length > 0 && Platform.OS === 'web') {
-          try {
-            replacePreview(await markCans(bytes, mime, analysis.boxes));
-          } catch {
-            // The unmarked preview is already on screen.
-          }
-        }
-        if (id !== runId.current) return;
-        setJob({ status: 'done', analysis });
+        setJob({ status: 'done', score });
       } catch (error) {
         if (id !== runId.current) return;
         setJob({
           status: 'failed',
-          message: error instanceof Error ? error.message : `Couldn't check ${name}.`,
+          message: error instanceof Error ? error.message : 'The photo check failed.',
         });
       }
     },
-    [ensureReady, replacePreview],
+    [replacePhotos],
   );
 
-  useEffect(() => {
-    runBytesRef.current = (bytes, mime) => {
-      void runBytes(bytes, mime, 'photo');
-    };
-  }, [runBytes]);
-
-  useEffect(() => {
-    if (!detectorSupported) return;
-    let cancelled = false;
-    void (async () => {
-      setPhase({ status: 'checking' });
-      const cached = await modelIsCached();
-      if (cancelled) return;
-      if (!cached) {
-        setPhase({ status: 'missing' });
+  const scoreFiles = useCallback(
+    async (files: File[]) => {
+      const images = files.filter((file) => file.type.startsWith('image/')).slice(0, 8);
+      if (images.length === 0) {
+        setJob({ status: 'failed', message: 'Choose a JPEG, PNG, or WebP photo.' });
         return;
       }
       try {
-        await ensureReady();
-      } catch {
-        // ensureReady records the message on phase.
+        const payloads = await Promise.all(images.map((file) => photoFromBlob(file)));
+        await runPayloads(payloads);
+      } catch (error) {
+        setJob({
+          status: 'failed',
+          message: error instanceof Error ? error.message : "Couldn't read that photo.",
+        });
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [ensureReady]);
+    },
+    [runPayloads],
+  );
 
   useEffect(() => {
-    if (Platform.OS !== 'web') return;
+    scoreFilesRef.current = (files) => {
+      void scoreFiles(files);
+    };
+  }, [scoreFiles]);
+
+  const cameraOpen = camera === 'live' || camera === 'opening';
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || cameraOpen) return;
     const node = dropRef.current as unknown as HTMLElement | null;
     if (!node || typeof node.addEventListener !== 'function') return;
 
@@ -165,11 +233,9 @@ export function HomeScreen() {
     const onDrop = (event: DragEvent) => {
       event.preventDefault();
       setDragActive(false);
-      const file = event.dataTransfer?.files?.[0];
-      if (!file) return;
-      void file.arrayBuffer().then((buffer) => {
-        runBytesRef.current(new Uint8Array(buffer), file.type || 'image/*', file.name);
-      });
+      const files = [...(event.dataTransfer?.files ?? [])];
+      if (files.length === 0) return;
+      scoreFilesRef.current(files);
     };
 
     node.addEventListener('dragover', onDragOver);
@@ -180,37 +246,109 @@ export function HomeScreen() {
       node.removeEventListener('dragleave', onDragLeave);
       node.removeEventListener('drop', onDrop);
     };
-  }, [phase.status]);
+  }, [cameraOpen]);
 
-  const busy =
-    phase.status === 'checking' ||
-    phase.status === 'downloading' ||
-    phase.status === 'starting' ||
-    job.status === 'running';
+  const busy = job.status === 'running';
+
+  const openCamera = useCallback(() => {
+    if (Platform.OS !== 'web' || busy) return;
+    setCameraMessage(null);
+    setCamera('opening');
+    void navigator.mediaDevices
+      .getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' } } })
+      .then((stream) => {
+        streamRef.current = stream;
+        setCamera('live');
+      })
+      .catch(() => {
+        setCamera('blocked');
+        setCameraMessage('This browser could not open the camera. Choose a photo instead.');
+      });
+  }, [busy]);
+
+  const takePicture = useCallback(() => {
+    const video = videoRef.current;
+    if (capturing || !video || video.videoWidth === 0) {
+      if (!capturing) setCameraMessage('The camera is still starting.');
+      return;
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      setCameraMessage("Couldn't read that photo.");
+      return;
+    }
+    ctx.drawImage(video, 0, 0);
+    const current = step;
+    const index = shotIndex;
+    const token = captureToken.current;
+    setCapturing(true);
+    canvas.toBlob((blob) => {
+      if (token !== captureToken.current) return;
+      if (!blob) {
+        setCapturing(false);
+        setCameraMessage("Couldn't read that photo.");
+        return;
+      }
+      void photoFromBlob(blob)
+        .then((payload) => {
+          if (token !== captureToken.current) {
+            URL.revokeObjectURL(payload.previewUrl);
+            return;
+          }
+          pendingShotsRef.current = [...pendingShotsRef.current, payload];
+          setCameraMessage(null);
+          setCapturing(false);
+          const lastInSet = index >= SHOT_SCALES.length - 1;
+          if (!lastInSet) {
+            setShotIndex(index + 1);
+            return;
+          }
+          if (current === 'meter') {
+            setStep('breaker');
+            setShotIndex(0);
+            return;
+          }
+          const taken = pendingShotsRef.current;
+          pendingShotsRef.current = [];
+          setStep('meter');
+          setShotIndex(0);
+          closeCamera();
+          void runPayloads(taken);
+        })
+        .catch((error: unknown) => {
+          if (token !== captureToken.current) return;
+          setCapturing(false);
+          setCameraMessage(error instanceof Error ? error.message : "Couldn't read that photo.");
+        });
+    }, 'image/jpeg', 0.92);
+  }, [capturing, closeCamera, runPayloads, shotIndex, step]);
 
   const choosePhoto = useCallback(() => {
     if (Platform.OS !== 'web' || busy) return;
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'image/*';
+    input.multiple = true;
     input.onchange = () => {
-      const file = input.files?.[0];
-      if (!file) return;
-      void file.arrayBuffer().then((buffer) => {
-        void runBytes(new Uint8Array(buffer), file.type || 'image/*', file.name);
-      });
+      const files = [...(input.files ?? [])];
+      if (files.length === 0) return;
+      closeCamera();
+      void scoreFiles(files);
     };
     input.click();
-  }, [busy, runBytes]);
+  }, [busy, closeCamera, scoreFiles]);
 
   const loadSample = useCallback(
-    (path: string, name: string) => {
+    (path: string) => {
       if (busy) return;
       void (async () => {
         const response = await fetch(path);
         if (!response.ok) throw new Error('The sample photo is missing.');
-        const buffer = await response.arrayBuffer();
-        await runBytes(new Uint8Array(buffer), 'image/jpeg', name);
+        const blob = await response.blob();
+        await runPayloads([await photoFromBlob(blob)]);
       })().catch((error: unknown) => {
         setJob({
           status: 'failed',
@@ -218,8 +356,58 @@ export function HomeScreen() {
         });
       });
     },
-    [busy, runBytes],
+    [busy, runPayloads],
   );
+
+  if (cameraOpen && Platform.OS === 'web') {
+    return (
+      <View style={styles.cameraScreen}>
+        <View ref={cameraFrameRef} style={styles.cameraFill} />
+        <View pointerEvents="box-none" style={styles.cameraOverlay}>
+          <View style={[styles.cameraHintBar, { paddingTop: insets.top + 16 }]}>
+            <Text style={styles.cameraHint}>{cameraHint(step, shotIndex)}</Text>
+            <Text style={styles.cameraCount}>
+              {shotIndex + 1} of {SHOT_SCALES.length}
+            </Text>
+          </View>
+          <View pointerEvents="none" style={styles.cameraGuide}>
+            {step === 'meter' ? (
+              <MeterOverlay scale={SHOT_SCALES[shotIndex]} />
+            ) : (
+              <BreakerOverlay scale={SHOT_SCALES[shotIndex]} />
+            )}
+          </View>
+          <View style={[styles.cameraDock, { paddingBottom: Math.max(insets.bottom, 16) }]}>
+            {cameraMessage ? <Text style={styles.cameraMessage}>{cameraMessage}</Text> : null}
+            {camera === 'live' ? (
+              <Pressable
+                accessibilityLabel={
+                  step === 'meter'
+                    ? `Take meter picture ${shotIndex + 1} of ${SHOT_SCALES.length}`
+                    : `Take breaker picture ${shotIndex + 1} of ${SHOT_SCALES.length}`
+                }
+                accessibilityRole="button"
+                disabled={busy || capturing}
+                onPress={takePicture}
+                style={({ pressed }) => [
+                  styles.shutter,
+                  pressed && styles.pressed,
+                  (busy || capturing) && styles.disabled,
+                ]}
+              >
+                <View style={styles.shutterCore} />
+              </Pressable>
+            ) : (
+              <View style={styles.opening}>
+                <ActivityIndicator color="#ffffff" />
+                <Text style={styles.cameraMessage}>Opening the camera…</Text>
+              </View>
+            )}
+          </View>
+        </View>
+      </View>
+    );
+  }
 
   return (
     <ScrollView
@@ -230,114 +418,146 @@ export function HomeScreen() {
       style={styles.scroll}
     >
       <ScreenHeader
-        subtitle="Upload a picture. A model running in this browser looks for an aluminum can. The file stays on this device."
-        title="Find a can"
+        subtitle="A few photos of the meter, then the breaker. Step back when the outline shrinks."
+        title="Take a picture"
       />
 
-      {detectorSupported ? (
+      {Platform.OS === 'web' ? (
         <>
-          <View style={styles.card}>
-            <ModelStatus phase={phase} styles={styles} />
-            {phase.status === 'missing' || phase.status === 'error' ? (
+          <View ref={dropRef} style={[styles.drop, dragActive && styles.dropActive]}>
+            <Text style={styles.dropTitle}>Take a picture of the meter</Text>
+            <Text style={styles.dropBody}>
+              The outline starts large, then shrinks so the next photos are from farther back. Then
+              the same for the breaker. The photos stay on this computer. You can also drop photos
+              here.
+            </Text>
+            {cameraMessage ? <Text style={styles.cardBody}>{cameraMessage}</Text> : null}
+            <View style={styles.actions}>
               <Pressable
                 accessibilityRole="button"
                 disabled={busy}
-                onPress={() => {
-                  void ensureReady().catch(() => undefined);
-                }}
+                onPress={openCamera}
                 style={({ pressed }) => [
                   styles.primaryButton,
                   pressed && styles.pressed,
                   busy && styles.disabled,
                 ]}
               >
-                <Text style={styles.primaryLabel}>
-                  {phase.status === 'error' ? 'Try again' : `Download detector (${MODEL_MB} MB)`}
-                </Text>
+                <Text style={styles.primaryLabel}>Take a picture</Text>
               </Pressable>
-            ) : null}
-          </View>
-
-          {previewUri ? (
-            <View style={isDesktop ? styles.resultRow : styles.resultStack}>
-              <View style={styles.previewFrame}>
-                <Image
-                  accessibilityLabel="Selected photo"
-                  resizeMode="contain"
-                  source={{ uri: previewUri }}
-                  style={styles.preview}
-                />
-              </View>
-              <VerdictCard colors={colors} isDark={isDark} job={job} styles={styles} />
-            </View>
-          ) : null}
-
-          <View ref={dropRef} style={[styles.drop, dragActive && styles.dropActive]}>
-            <Text style={styles.dropTitle}>Drop a photo here</Text>
-            <Text style={styles.dropBody}>JPEG, PNG, or WebP. Detection happens in the browser.</Text>
-            <View style={styles.actions}>
               <Pressable
                 accessibilityRole="button"
                 disabled={busy}
                 onPress={choosePhoto}
                 style={({ pressed }) => [
-                  styles.primaryButton,
+                  styles.secondaryButton,
                   pressed && styles.pressed,
                   busy && styles.disabled,
                 ]}
               >
-                <Text style={styles.primaryLabel}>Choose a photo</Text>
+                <Text style={styles.secondaryLabel}>Choose a photo</Text>
               </Pressable>
               <Pressable
                 accessibilityRole="button"
                 disabled={busy}
-                onPress={() => loadSample('/samples/can.jpg', 'Can sample')}
+                onPress={() => loadSample('/samples/main-switch.jpg')}
                 style={({ pressed }) => [
                   styles.secondaryButton,
                   pressed && styles.pressed,
                   busy && styles.disabled,
                 ]}
               >
-                <Text style={styles.secondaryLabel}>Sample with a can</Text>
+                <Text style={styles.secondaryLabel}>Sample: main switch</Text>
               </Pressable>
               <Pressable
                 accessibilityRole="button"
                 disabled={busy}
-                onPress={() => loadSample('/samples/photo.jpg', 'Apollo 11 sample')}
+                onPress={() => loadSample('/samples/closed-lid.jpg')}
                 style={({ pressed }) => [
                   styles.secondaryButton,
                   pressed && styles.pressed,
                   busy && styles.disabled,
                 ]}
               >
-                <Text style={styles.secondaryLabel}>Sample without a can</Text>
+                <Text style={styles.secondaryLabel}>Sample: lid closed</Text>
               </Pressable>
             </View>
-            <Text style={styles.fine}>
-              Can sample: Patrick Fitzgerald, CC BY 2.0. Other sample: Apollo 11, NASA.
-            </Text>
+          </View>
+
+          {photos.length > 0 ? (
+            <View style={isDesktop ? styles.resultRow : styles.resultStack}>
+              <View style={styles.previewColumn}>
+                {photos.map((photo) => (
+                  <View key={photo.previewUrl} style={styles.previewFrame}>
+                    <Image
+                      accessibilityLabel="Home photo"
+                      resizeMode="contain"
+                      source={{ uri: photo.previewUrl }}
+                      style={styles.preview}
+                    />
+                  </View>
+                ))}
+              </View>
+              <ScoreBanner colors={colors} isDark={isDark} job={job} styles={styles} />
+            </View>
+          ) : null}
+
+          <View style={styles.questions}>
+            {QUESTIONS.map((item) => {
+              const check = job.status === 'done' ? job.score.checks.find((entry) => entry.id === item.id) : null;
+              return (
+                <QuestionCard
+                  key={item.id}
+                  answer={check?.answer}
+                  checkId={item.id}
+                  colors={colors}
+                  detail={item.detail}
+                  isDark={isDark}
+                  question={item.question}
+                  status={check?.status}
+                  styles={styles}
+                />
+              );
+            })}
           </View>
 
           <Text style={styles.credit}>
-            YOLOv8n trained on drink cans and food cans from the{' '}
+            200 amps fits two batteries. 100 to 199 fits one. Under 100 fits none. Solar needs 200
+            amps. The other two questions go to a person unless the photo makes them obvious.
+          </Text>
+          <Text style={styles.credit}>
+            Main switch sample:{' '}
             <Text
               accessibilityRole="link"
               onPress={() => {
-                void Linking.openURL(manifest.sourceRepo);
+                void Linking.openURL(
+                  'https://commons.wikimedia.org/wiki/File:Stab-Lok_circuit_breaker_panel_interior_.jpg',
+                );
               }}
               style={styles.link}
             >
-              TACO dataset
+              Repeater-reclaim, CC BY-SA 4.0
             </Text>
-            . A can is outlined when its score clears {Math.round(manifest.threshold * 100)}%.
+            . Closed lid:{' '}
+            <Text
+              accessibilityRole="link"
+              onPress={() => {
+                void Linking.openURL(
+                  'https://commons.wikimedia.org/wiki/File:Eaton_circuit_breaker_panel_closed.JPG',
+                );
+              }}
+              style={styles.link}
+            >
+              BrokenSphere, CC BY-SA 3.0
+            </Text>
+            .
           </Text>
         </>
       ) : (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Open this page in a browser</Text>
           <Text style={styles.cardBody}>
-            Detection runs in the browser with WebAssembly, on this device. Use the web app to check
-            a photo.
+            The photo check runs on this computer. Use the web app to score a home.
           </Text>
         </View>
       )}
@@ -345,70 +565,7 @@ export function HomeScreen() {
   );
 }
 
-function ModelStatus({
-  phase,
-  styles,
-}: {
-  phase: Phase;
-  styles: ReturnType<typeof createStyles>;
-}) {
-  if (phase.status === 'checking') {
-    return (
-      <View style={styles.statusRow}>
-        <ActivityIndicator />
-        <Text style={styles.cardBody}>Checking for a saved copy of the model…</Text>
-      </View>
-    );
-  }
-  if (phase.status === 'missing') {
-    return (
-      <>
-        <Text style={styles.cardTitle}>Download the model once</Text>
-        <Text style={styles.cardBody}>
-          The can detector is {MODEL_MB} MB. It downloads from this site, stays on this device, and
-          runs without sending the photo anywhere.
-        </Text>
-      </>
-    );
-  }
-  if (phase.status === 'downloading') {
-    const ratio = phase.total > 0 ? Math.min(1, phase.loaded / phase.total) : 0;
-    return (
-      <>
-        <Text style={styles.cardTitle}>Downloading the detector</Text>
-        <Text style={styles.cardBody}>
-          {formatMb(phase.loaded)} of {formatMb(phase.total || manifest.bytes)}
-        </Text>
-        <View style={styles.track}>
-          <View style={[styles.fill, { width: `${ratio * 100}%` }]} />
-        </View>
-      </>
-    );
-  }
-  if (phase.status === 'starting') {
-    return (
-      <View style={styles.statusRow}>
-        <ActivityIndicator />
-        <Text style={styles.cardBody}>Starting the model. The first run compiles it for this browser.</Text>
-      </View>
-    );
-  }
-  if (phase.status === 'ready') {
-    return (
-      <Text style={styles.cardBody}>
-        Ready on this device · {phase.backend}
-      </Text>
-    );
-  }
-  return (
-    <>
-      <Text style={styles.cardTitle}>Detector setup failed</Text>
-      <Text style={styles.cardBody}>{phase.message}</Text>
-    </>
-  );
-}
-
-function VerdictCard({
+function ScoreBanner({
   job,
   styles,
   colors,
@@ -423,7 +580,8 @@ function VerdictCard({
     return (
       <View style={styles.verdict}>
         <ActivityIndicator />
-        <Text style={styles.cardBody}>Analyzing the photo…</Text>
+        <Text style={styles.cardTitle}>Reading the photos</Text>
+        <Text style={styles.cardBody}>Looking for the number on the main switch, and for a photo that needs a retake.</Text>
       </View>
     );
   }
@@ -436,71 +594,72 @@ function VerdictCard({
     );
   }
   if (job.status !== 'done') return null;
-  const { analysis } = job;
-  const tone = tonePalette(analysis.tone, colors, isDark);
+  const tone = outcomeTone(job.score.outcome, colors, isDark);
   return (
     <View
       accessibilityLiveRegion="polite"
       style={[styles.verdict, { backgroundColor: tone.background, borderColor: tone.foreground }]}
     >
-      {analysis.percent !== null ? (
-        <Text style={[styles.percent, { color: tone.foreground }]}>{analysis.percent}%</Text>
-      ) : null}
-      <Text style={[styles.verdictLabel, { color: tone.foreground }]}>{analysis.label}</Text>
-      <Text style={styles.cardBody}>{analysis.detail}</Text>
+      <Text style={[styles.verdictLabel, { color: tone.foreground }]}>{headline(job.score)}</Text>
+      <Text style={styles.cardBody}>{job.score.reason}</Text>
     </View>
   );
 }
 
-function tonePalette(
-  tone: PhotoAnalysis['tone'],
+function QuestionCard({
+  question,
+  detail,
+  answer,
+  status,
+  checkId,
+  styles,
+  colors,
+  isDark,
+}: {
+  question: string;
+  detail: string;
+  answer?: string;
+  status?: Check['status'];
+  checkId: Check['id'];
+  styles: ReturnType<typeof createStyles>;
+  colors: AppThemeColors;
+  isDark: boolean;
+}) {
+  const retake = checkId === 'photos' && status === 'fail';
+  const tone = status
+    ? outcomeTone(retake || status === 'unsure' ? 'unsure' : status === 'pass' ? 'yes' : 'no', colors, isDark)
+    : null;
+  const label = !status ? null : retake ? 'Retake' : status === 'pass' ? 'Yes' : status === 'fail' ? 'No' : 'Not sure';
+  return (
+    <View style={[styles.question, tone ? { borderLeftColor: tone.foreground } : null]}>
+      <View style={styles.questionHead}>
+        <Text style={styles.cardTitle}>{question}</Text>
+        {label && tone ? <Text style={[styles.pill, { color: tone.foreground }]}>{label}</Text> : null}
+      </View>
+      <Text style={styles.cardBody}>{answer ?? detail}</Text>
+    </View>
+  );
+}
+
+function headline(score: HomeScore): string {
+  if (score.outcome === 'yes') return `✅ ${score.headline}`;
+  if (score.outcome === 'unsure') return `🟡 ${score.headline}`;
+  if (score.outcome === 'no') return `❌ ${score.headline}`;
+  return score.headline;
+}
+
+function outcomeTone(
+  outcome: Outcome | 'yes' | 'unsure' | 'no',
   colors: AppThemeColors,
   isDark: boolean,
 ): { foreground: string; background: string } {
-  if (tone === 'can') {
+  if (outcome === 'yes') {
     return { foreground: isDark ? '#6ee7b7' : '#067647', background: isDark ? '#123328' : '#e7f6ee' };
   }
-  if (tone === 'clear') return { foreground: colors.text, background: colors.surface };
-  return { foreground: colors.textSecondary, background: colors.surface };
-}
-
-async function markCans(bytes: Uint8Array, mime: string, boxes: CanBox[]): Promise<string> {
-  const blob = new Blob([bytesToBuffer(bytes)], { type: mime || 'image/*' });
-  const bitmap = await createImageBitmap(blob);
-  try {
-    const canvas = document.createElement('canvas');
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return URL.createObjectURL(blob);
-    ctx.drawImage(bitmap, 0, 0);
-    ctx.strokeStyle = APP_BRAND_HEX;
-    ctx.lineWidth = Math.max(3, Math.round(bitmap.width / 180));
-    for (const box of boxes) {
-      ctx.strokeRect(
-        box.x * bitmap.width,
-        box.y * bitmap.height,
-        box.width * bitmap.width,
-        box.height * bitmap.height,
-      );
-    }
-    const marked = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, 'image/jpeg', 0.92);
-    });
-    return URL.createObjectURL(marked ?? blob);
-  } finally {
-    bitmap.close();
+  if (outcome === 'no') {
+    return { foreground: colors.error, background: isDark ? '#3b1515' : '#fdeceb' };
   }
-}
-
-function formatMb(bytes: number): string {
-  return `${(bytes / 1_000_000).toFixed(1)} MB`;
-}
-
-function bytesToBuffer(bytes: Uint8Array): ArrayBuffer {
-  const copy = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(copy).set(bytes);
-  return copy;
+  return { foreground: isDark ? '#fbbf24' : '#b54708', background: isDark ? '#3b2a10' : '#fff6e8' };
 }
 
 function createStyles(colors: AppThemeColors) {
@@ -529,29 +688,15 @@ function createStyles(colors: AppThemeColors) {
       fontSize: 18,
       fontWeight: '700',
       color: colors.text,
+      flexShrink: 1,
     },
     cardBody: {
       fontSize: 15,
       lineHeight: 22,
       color: colors.textSecondary,
     },
-    statusRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 12,
-    },
-    track: {
-      height: 8,
-      borderRadius: 999,
-      backgroundColor: colors.border,
-      overflow: 'hidden',
-    },
-    fill: {
-      height: '100%',
-      backgroundColor: colors.brand,
-    },
     drop: {
-      marginTop: 16,
+      marginTop: 24,
       padding: 24,
       borderRadius: 16,
       borderWidth: 1,
@@ -562,6 +707,77 @@ function createStyles(colors: AppThemeColors) {
     },
     dropActive: {
       borderColor: colors.brand,
+    },
+    cameraScreen: {
+      flex: 1,
+      backgroundColor: '#000000',
+    },
+    cameraFill: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: '#000000',
+    },
+    cameraOverlay: {
+      ...StyleSheet.absoluteFillObject,
+      justifyContent: 'space-between',
+    },
+    cameraGuide: {
+      flex: 1,
+    },
+    cameraHintBar: {
+      paddingHorizontal: 24,
+      paddingBottom: 20,
+      backgroundColor: 'rgba(0, 0, 0, 0.35)',
+    },
+    cameraHint: {
+      color: '#ffffff',
+      fontSize: 16,
+      lineHeight: 22,
+      textAlign: 'center',
+      textShadowColor: 'rgba(0, 0, 0, 0.85)',
+      textShadowOffset: { width: 0, height: 1 },
+      textShadowRadius: 8,
+    },
+    cameraCount: {
+      marginTop: 6,
+      color: 'rgba(255, 255, 255, 0.82)',
+      fontSize: 13,
+      fontWeight: '600',
+      textAlign: 'center',
+    },
+    cameraDock: {
+      alignItems: 'center',
+      gap: 18,
+      paddingTop: 28,
+      paddingBottom: 12,
+      paddingHorizontal: 24,
+      backgroundColor: 'rgba(0, 0, 0, 0.45)',
+    },
+    cameraMessage: {
+      color: '#ffffff',
+      fontSize: 15,
+      lineHeight: 22,
+      textAlign: 'center',
+    },
+    shutter: {
+      width: 78,
+      height: 78,
+      borderRadius: 39,
+      borderWidth: 4,
+      borderColor: '#ffffff',
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    shutterCore: {
+      width: 62,
+      height: 62,
+      borderRadius: 31,
+      backgroundColor: '#ffffff',
+    },
+    opening: {
+      minHeight: 78,
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 12,
     },
     dropTitle: {
       fontSize: 20,
@@ -609,11 +825,6 @@ function createStyles(colors: AppThemeColors) {
     disabled: {
       opacity: 0.5,
     },
-    fine: {
-      fontSize: 13,
-      lineHeight: 18,
-      color: colors.textMuted,
-    },
     resultRow: {
       marginTop: 16,
       flexDirection: 'row',
@@ -624,8 +835,11 @@ function createStyles(colors: AppThemeColors) {
       marginTop: 16,
       gap: 16,
     },
-    previewFrame: {
+    previewColumn: {
       flex: 1,
+      gap: 12,
+    },
+    previewFrame: {
       height: 280,
       borderRadius: 16,
       overflow: 'hidden',
@@ -639,7 +853,7 @@ function createStyles(colors: AppThemeColors) {
     },
     verdict: {
       flex: 1,
-      minHeight: 280,
+      minHeight: 180,
       borderRadius: 16,
       borderWidth: 1,
       borderColor: colors.border,
@@ -648,17 +862,38 @@ function createStyles(colors: AppThemeColors) {
       gap: 8,
       justifyContent: 'flex-start',
     },
-    percent: {
-      fontSize: 56,
-      fontWeight: '700',
-      lineHeight: 60,
-    },
     verdictLabel: {
-      fontSize: 22,
+      fontSize: 28,
+      fontWeight: '700',
+      lineHeight: 34,
+    },
+    questions: {
+      marginTop: 16,
+      gap: 12,
+    },
+    question: {
+      padding: 16,
+      paddingLeft: 18,
+      borderRadius: 16,
+      borderWidth: 1,
+      borderLeftWidth: 4,
+      borderColor: colors.border,
+      borderLeftColor: colors.border,
+      backgroundColor: colors.surface,
+      gap: 6,
+    },
+    questionHead: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      gap: 12,
+    },
+    pill: {
+      fontSize: 14,
       fontWeight: '700',
     },
     credit: {
-      marginTop: 20,
+      marginTop: 16,
       fontSize: 13,
       lineHeight: 20,
       color: colors.textMuted,

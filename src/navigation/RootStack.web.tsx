@@ -28,11 +28,14 @@ export function RootStack() {
             : { backgroundColor: colors.background },
       }}
     >
-      <WebStack.Screen
-        name="home"
-        component={rootStackScreens.home}
-        options={{ title: rootStackScreenTitles.home }}
-      />
+      {(Object.keys(rootStackScreens) as (keyof RootStackParamList)[]).map((name) => (
+        <WebStack.Screen
+          key={name}
+          name={name}
+          component={rootStackScreens[name]}
+          options={{ title: rootStackScreenTitles[name] }}
+        />
+      ))}
     </WebStack.Navigator>
   );
 }

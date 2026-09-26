@@ -31,7 +31,9 @@ export const rootLinking: LinkingOptions<RootStackParamList> = {
   prefixes: getLinkingPrefixes(),
   config: {
     screens: {
-      home: '',
+      welcome: '',
+      photos: 'photos',
+      mapDetector: 'mapDetector',
     },
   },
 };

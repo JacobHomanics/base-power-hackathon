@@ -4,12 +4,11 @@
   "main": "index.ts",
   "private": true,
   "scripts": {
-    "postinstall": "node scripts/prepare-detector.mjs",
     "start": "expo start",
-    "web": "node scripts/prepare-detector.mjs && expo start --web",
+    "web": "node scripts/dev-web.mjs",
     "ios": "expo start --ios",
     "android": "expo start --android",
-    "build:web": "node scripts/prepare-detector.mjs && expo export -p web",
+    "build:web": "expo export -p web",
     "lint": "eslint . --max-warnings 0 && tsc --noEmit --incremental",
     "check-types": "tsc --noEmit --incremental"
   },

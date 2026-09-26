@@ -40,6 +40,10 @@ yarn-error.*
 /public/model/
 /public/ort/
 
+# Local photo checker
+.venv/
+.cache/
+
 # generated native folders
 /ios
 /android

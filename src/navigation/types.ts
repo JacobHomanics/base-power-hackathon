@@ -1,5 +1,7 @@
 export type RootStackParamList = {
-  home: undefined;
+  welcome: undefined;
+  photos: undefined;
+  mapDetector: undefined;
 };
 
-export const ROOT_STACK_INITIAL_ROUTE: keyof RootStackParamList = 'home';
+export const ROOT_STACK_INITIAL_ROUTE: keyof RootStackParamList = 'welcome';
